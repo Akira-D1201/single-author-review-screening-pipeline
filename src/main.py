@@ -1,145 +1,392 @@
-import pandas as pd
-import time
-import os
-from openai import OpenAI
-from dotenv import load_dotenv
+#!/usr/bin/env python3
+"""
+Title and abstract screening script for systematic reviews and meta-analyses.
 
-# Set TEST_RUN_MAX = 200 for small test; set to None to process full dataset
-# ====================== Configuration Section ======================
-# Local input/output files (stored locally, NOT pushed to GitHub)
-INPUT_CSV = "zotero_all.csv"
-OUTPUT_CSV = "screen_mci_new_asreview_ready.csv"
+This script is designed for the early screening stage. It keeps the comparator
+(C) in the final eligibility framework, but it does NOT hard-exclude records
+merely because the title or abstract does not mention a comparator. Instead,
+it assigns a C_status flag and sends uncertain records to full-text screening.
 
-LOG1 = "screen_log1.csv"
-LOG2 = "screen_log2.csv"
-TEMP_A = "_temp_a.csv"
-TEMP_B = "_temp_b.csv"
+It also includes study design (S) signals so that RCTs and controlled trials
+can be flagged automatically.
 
-MODEL = "deepseek-flash"
-SLEEP_SEC = 0.7
-TEST_RUN_MAX = None   # Set 200 for test sample; None for full run
-# =================================================================
+Requirements:
+    pandas
+    openpyxl
 
-# Load secret key from local .env file, .env will NOT be committed to GitHub
-load_dotenv()
-API_KEY = os.getenv("DEEPSEEK_API_KEY")
-BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-
-if not API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY not found in local .env file!")
-
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-
-PROMPT = """Inclusion criteria (ALL four items must be satisfied for output: include):
-1. Population: older adults with Mild Cognitive Impairment (MCI)
-2. Intervention: non‑pharmacological behavioral interventions (exercise, cognitive training, mindfulness, multi‑domain combined intervention, etc.)
-3. Study design: original randomized controlled trial (RCT), RCT must be explicitly stated in abstract
-4. Outcome: cognitive‑function‑related outcomes
-
-Exclusion rule: output exclude if ANY exclusion item is matched, no need to check inclusion criteria.
-Exclusion list: reviews, meta‑analyses, systematic reviews, case reports, study protocols, animal experiments, brain stimulation interventions, pharmacological/drug interventions, non‑MCI populations, non‑RCT studies.
-
-Decision rules:
-Sufficient information + satisfy all four inclusion criteria → include
-Sufficient information + hit any exclusion item → exclude
-Insufficient information for confident judgement → uncertain
-
-Only output one single word: include / exclude / uncertain. Do NOT add any extra explanation.
+Usage:
+    python screening.py --input records.xlsx --output screening_results.xlsx
+    python screening.py --input records.csv --output screening_results.csv
 """
 
-# Local blacklist keywords: skip LLM API call if matched
-BLACK_WORDS = [
-    "meta‑analysis", "meta analysis", "systematic review", "system review",
-    "review", "meta分析", "系统综述",
-    "animal", "rat", "mouse", "mice", "大鼠", "小鼠", "动物实验",
-    "alzheimer", "阿尔茨海默",
-    "drug", "pharmacological", "药物", "pharmaceutical",
-    "case report", "case series", "病例报告", "病例系列"
+import argparse
+import os
+import re
+from typing import List, Optional, Tuple
+
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Column aliases
+# ---------------------------------------------------------------------------
+
+COLUMN_ALIASES = {
+    "title": ["title", "article title", "ti", "标题", "题名", "篇名"],
+    "abstract": ["abstract", "ab", "摘要", "文摘"],
+    "authors": ["authors", "author", "au", "作者"],
+    "year": ["year", "publication year", "py", "年份", "发表年份"],
+    "doi": ["doi", "digital object identifier"],
+    "pmid": ["pmid", "pubmed id", "pubmed pmid"],
+}
+
+
+# ---------------------------------------------------------------------------
+# Keyword lists
+# ---------------------------------------------------------------------------
+
+POPULATION_TERMS = [
+    "older adults", "older adult", "elderly", "aged", "senior", "seniors",
+    "geriatric", "geriatrics", "cognitive impairment", "cognitive decline",
+    "dementia", "mild cognitive impairment", "mci", "alzheimer",
+    "alzheimer's disease", "老年人", "老人", "高龄", "认知障碍", "认知衰退",
+    "痴呆", "轻度认知障碍", "阿尔茨海默",
+]
+
+INTERVENTION_TERMS = [
+    "non-pharmacological", "nonpharmacological", "non-drug",
+    "non-drug intervention", "exercise", "physical activity",
+    "cognitive training", "cognitive stimulation", "reminiscence therapy",
+    "music therapy", "diet", "nutrition", "mindfulness", "tai chi", "yoga",
+    "acupuncture", "behavioral intervention", "behavioural intervention",
+    "psychosocial", "occupational therapy", "multicomponent", "multi-component",
+    "非药物", "非药物治疗", "运动", "体育锻炼", "认知训练", "认知刺激",
+    "回忆疗法", "音乐疗法", "饮食", "营养", "正念", "太极", "瑜伽",
+    "针灸", "行为干预", "心理社会", "作业疗法", "多组分", "多成分",
+]
+
+COMPARATOR_TERMS = [
+    "control", "controls", "comparator", "comparison group", "usual care",
+    "routine care", "standard care", "waitlist", "waiting list", "placebo",
+    "sham", "active control", "attention control", "no intervention",
+    "对照", "对照组", "比较组", "常规护理", "常规照护", "标准护理",
+    "等待名单", "候补名单", "安慰剂", "假刺激", "主动对照", "注意力对照",
+    "无干预",
+]
+
+NO_COMPARATOR_TERMS = [
+    "single-arm", "single arm", "uncontrolled", "no control group",
+    "case series", "case report", "before-after", "pre-post",
+    "self-controlled", "单臂", "无对照组", "病例系列", "病例报告",
+    "自身前后", "前后自身",
+]
+
+STUDY_DESIGN_TERMS = [
+    "randomized controlled trial", "randomised controlled trial", "rct",
+    "randomized", "randomised", "controlled trial", "clinical trial",
+    "randomized clinical trial", "randomised clinical trial",
+    "随机对照", "随机", "对照试验", "临床试验",
+]
+
+RCT_TERMS = [
+    "randomized controlled trial", "randomised controlled trial", "rct",
+    "randomized clinical trial", "randomised clinical trial",
+    "随机对照", "随机对照试验",
+]
+
+OUTCOME_TERMS = [
+    "cognitive function", "cognition", "memory", "executive function",
+    "attention", "mmse", "moca", "adas-cog", "认知功能", "认知",
+    "记忆", "执行功能", "注意力", "简易智力状态检查", "蒙特利尔认知评估",
 ]
 
 
-def call_llm(title: str, abstract: str) -> str:
-    text = f"Title:{title}\nAbstract:{abstract}"
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": PROMPT + "\n" + text}],
-            temperature=0.0,
-            max_tokens=10
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def contains_term(text: str, term: str) -> bool:
+    """
+    Return True if the term appears in the text.
+
+    English terms are matched with simple word boundaries to avoid false
+    positives such as 'aged' inside 'managed'. Chinese terms are matched
+    by direct substring search.
+    """
+    term_lower = term.lower()
+
+    if re.search(r"[\u4e00-\u9fff]", term_lower):
+        return term_lower in text
+
+    pattern = r"(?<![a-z0-9])" + re.escape(term_lower) + r"(?![a-z0-9])"
+    return re.search(pattern, text) is not None
+
+
+def find_matches(text: str, terms: List[str]) -> List[str]:
+    """Return all terms that appear in the text."""
+    return [term for term in terms if contains_term(text, term)]
+
+
+def find_column(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
+    """Find the first matching column name from a list of aliases."""
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
+
+    for alias in aliases:
+        key = alias.strip().lower()
+        if key in lower_map:
+            return lower_map[key]
+
+    return None
+
+
+def read_input(path: str, sheet: Optional[str] = None) -> pd.DataFrame:
+    """Read a CSV or Excel input file."""
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".csv":
+        try:
+            return pd.read_csv(path)
+        except UnicodeDecodeError:
+            try:
+                return pd.read_csv(path, encoding="gbk")
+            except UnicodeDecodeError:
+                return pd.read_csv(path, encoding="gb18030")
+
+    if ext in [".xlsx", ".xls"]:
+        return pd.read_excel(path, sheet_name=sheet if sheet else 0)
+
+    raise ValueError("Unsupported input format. Use .csv, .xlsx, or .xls.")
+
+
+def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize title, abstract, and optional metadata columns."""
+    title_col = find_column(df, COLUMN_ALIASES["title"])
+    abstract_col = find_column(df, COLUMN_ALIASES["abstract"])
+
+    if title_col is None and abstract_col is None:
+        raise ValueError(
+            "No title or abstract column found. Please check the input file."
         )
-        ans = resp.choices[0].message.content.strip().lower()
-        if ans in ("include", "exclude", "uncertain"):
-            return ans
-        return "uncertain"
-    except Exception as e:
-        print(f"API Exception:{e}")
-        return "uncertain"
+
+    out = pd.DataFrame()
+    out["record_id"] = range(1, len(df) + 1)
+
+    out["title"] = (
+        df[title_col].fillna("").astype(str) if title_col else ""
+    )
+    out["abstract"] = (
+        df[abstract_col].fillna("").astype(str) if abstract_col else ""
+    )
+
+    optional_columns = {
+        "authors": COLUMN_ALIASES["authors"],
+        "year": COLUMN_ALIASES["year"],
+        "doi": COLUMN_ALIASES["doi"],
+        "pmid": COLUMN_ALIASES["pmid"],
+    }
+
+    for out_col, aliases in optional_columns.items():
+        col = find_column(df, aliases)
+        out[out_col] = df[col].fillna("").astype(str) if col else ""
+
+    out["text"] = (out["title"] + " " + out["abstract"]).str.lower()
+
+    return out
 
 
-def safe_save(df, path_a, path_b):
-    """Double backup: save dataframe to two separate csv files to avoid data loss"""
-    df.to_csv(path_a, index=False, encoding="utf-8-sig")
-    df.to_csv(path_b, index=False, encoding="utf-8-sig")
+def determine_c_status(
+    c_mentioned: bool,
+    s_mentioned: bool,
+    rct_mentioned: bool,
+    explicit_no_c: bool,
+) -> str:
+    """
+    Determine comparator status for title and abstract screening.
+
+    This is intentionally not a hard exclusion rule unless the record
+    explicitly states that there is no comparator.
+    """
+    if explicit_no_c:
+        return "explicit_no_comparator"
+
+    if c_mentioned:
+        return "possible"
+
+    if rct_mentioned:
+        return "likely_via_rct_design"
+
+    if s_mentioned:
+        return "possible_via_study_design"
+
+    return "pending_full_text"
 
 
-def main():
-    # Resume from previous breakpoint if log files exist
-    if os.path.exists(LOG1) and os.path.exists(LOG2):
-        df = pd.read_csv(LOG1, encoding="utf-8-sig")
-        print(f"Log files detected, resume previous run, processed records: {len(df)}")
-    else:
-        df_raw = pd.read_csv(INPUT_CSV, encoding="utf-8-sig")
-        df = df_raw.copy()
-        df["ai_decision"] = ""
-        df["label_included"] = ""
-        safe_save(df, LOG1, LOG2)
+def determine_s_status(s_mentioned: bool) -> str:
+    """Determine study design status for title and abstract screening."""
+    if s_mentioned:
+        return "mentioned"
+    return "pending_full_text"
 
-    total_rows = len(df)
-    cnt = 0
-    for idx, row in df.iterrows():
-        # Skip records already processed
-        if row["ai_decision"] != "":
-            continue
 
-        if TEST_RUN_MAX is not None and cnt >= TEST_RUN_MAX:
-            print("Reach TEST_RUN_MAX threshold, sample run finished")
-            break
+def make_decision(row: pd.Series) -> Tuple[str, str]:
+    """
+    Make a title and abstract screening decision.
 
-        t = str(row["Title"]) if pd.notna(row["Title"]) else ""
-        a = str(row["Abstract Note"]) if pd.notna(row["Abstract Note"]) else ""
-        full_low = (t + " " + a).lower()
+    Comparator is not used as a hard exclusion criterion at this stage.
+    Records with population and intervention signals are sent to full text
+    even if the comparator is not mentioned in the abstract.
+    """
+    if row["explicit_no_comparator"]:
+        return (
+            "Exclude",
+            "Explicit no comparator / single-arm / case series",
+        )
 
-        dec = None
-        # Case 1: empty title or empty abstract
-        if len(t.strip()) == 0 or len(a.strip()) == 0:
-            print(f"idx={idx} Empty title or abstract → uncertain")
-            dec = "uncertain"
-        # Case 2: hit local blacklist keywords, skip LLM API
-        elif any(w in full_low for w in BLACK_WORDS):
-            print(f"idx={idx} Hit blacklist keywords → exclude, skip API call")
-            dec = "exclude"
-        # Case3: send request to DeepSeek LLM
-        else:
-            print(f"idx={idx} Call DeepSeek LLM API")
-            dec = call_llm(t, a)
-            time.sleep(SLEEP_SEC)
+    if not row["P_mentioned"] and not row["I_mentioned"]:
+        return (
+            "Exclude",
+            "No population or intervention signal in title/abstract",
+        )
 
-        df.at[idx, "ai_decision"] = dec
-        if dec == "include":
-            df.at[idx, "label_included"] = 1
-        elif dec == "exclude":
-            df.at[idx, "label_included"] = 0
-        else:
-            df.at[idx, "label_included"] = ""
+    if row["P_mentioned"] and row["I_mentioned"]:
+        return (
+            "Full-text screening",
+            "Population and intervention signals present; confirm C/O/S in full text",
+        )
 
-        cnt += 1
-        safe_save(df, LOG1, LOG2)
+    return (
+        "Full-text screening (uncertain)",
+        "Some PICOS signals missing; do not exclude at title/abstract stage",
+    )
 
-    # Export final output file ready for ASReview‑LAB import
-    safe_save(df, OUTPUT_CSV, TEMP_A)
-    print("\n======== Processing Complete =========")
-    print(f"Output file path: {OUTPUT_CSV}")
-    print(df["ai_decision"].value_counts())
+
+def screen_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Run title and abstract screening and return a structured result table."""
+    df = prepare_dataframe(df)
+
+    term_groups = {
+        "P": POPULATION_TERMS,
+        "I": INTERVENTION_TERMS,
+        "C": COMPARATOR_TERMS,
+        "O": OUTCOME_TERMS,
+        "S": STUDY_DESIGN_TERMS,
+    }
+
+    for prefix, terms in term_groups.items():
+        matches = df["text"].apply(lambda text: find_matches(text, terms))
+        df[f"matched_{prefix}"] = matches.apply(lambda items: "; ".join(items))
+        df[f"{prefix}_mentioned"] = matches.apply(bool)
+
+    rct_matches = df["text"].apply(lambda text: find_matches(text, RCT_TERMS))
+    df["matched_RCT"] = rct_matches.apply(lambda items: "; ".join(items))
+    df["RCT_mentioned"] = rct_matches.apply(bool)
+
+    df["explicit_no_comparator"] = df["text"].apply(
+        lambda text: any(contains_term(text, term) for term in NO_COMPARATOR_TERMS)
+    )
+
+    df["C_status"] = df.apply(
+        lambda row: determine_c_status(
+            row["C_mentioned"],
+            row["S_mentioned"],
+            row["RCT_mentioned"],
+            row["explicit_no_comparator"],
+        ),
+        axis=1,
+    )
+
+    df["S_status"] = df["S_mentioned"].apply(determine_s_status)
+
+    decisions = df.apply(make_decision, axis=1)
+    df["decision"] = decisions.apply(lambda item: item[0])
+    df["reason"] = decisions.apply(lambda item: item[1])
+
+    output_columns = [
+        "record_id",
+        "title",
+        "abstract",
+        "authors",
+        "year",
+        "doi",
+        "pmid",
+        "P_mentioned",
+        "I_mentioned",
+        "C_mentioned",
+        "O_mentioned",
+        "S_mentioned",
+        "RCT_mentioned",
+        "explicit_no_comparator",
+        "C_status",
+        "S_status",
+        "decision",
+        "reason",
+        "matched_P",
+        "matched_I",
+        "matched_C",
+        "matched_O",
+        "matched_S",
+        "matched_RCT",
+    ]
+
+    for col in output_columns:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df[output_columns]
+
+
+def save_output(df: pd.DataFrame, output_path: str) -> None:
+    """Save screening results to CSV or Excel."""
+    ext = os.path.splitext(output_path)[1].lower()
+
+    if ext == ".csv":
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        return
+
+    if ext in [".xlsx", ".xls"]:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Screening_Results", index=False)
+
+            summary = df["decision"].value_counts().reset_index()
+            summary.columns = ["decision", "count"]
+            summary.to_excel(writer, sheet_name="Summary", index=False)
+        return
+
+    raise ValueError("Unsupported output format. Use .csv, .xlsx, or .xls.")
+
+
+def main() -> None:
+    """Command-line entry point."""
+    parser = argparse.ArgumentParser(
+        description="Title and abstract screening for systematic review and meta-analysis."
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Input CSV or Excel file.",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Output CSV or Excel file.",
+    )
+    parser.add_argument(
+        "--sheet",
+        default=None,
+        help="Excel sheet name or index. Default: first sheet.",
+    )
+    args = parser.parse_args()
+
+    print(f"Reading input file: {args.input}")
+    raw_df = read_input(args.input, sheet=args.sheet)
+    print(f"Loaded {len(raw_df)} records.")
+
+    screened_df = screen_dataframe(raw_df)
+    save_output(screened_df, args.output)
+
+    print(f"Saved screening results to: {args.output}")
+    print("Decision summary:")
+    print(screened_df["decision"].value_counts().to_string())
 
 
 if __name__ == "__main__":
