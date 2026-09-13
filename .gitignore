@@ -1,14 +1,4 @@
-# API secret / environment
-.env
-*.env
-
-# python cache
-__pycache__/
-*.pyc
-
-# local output csv
-output_*.csv
-
-# real literature data (never push real data)
-*.bib
-real_dataset*.csv
+git rm -r --cached .
+git add .
+git commit -m "chore: enforce data desensitization and remove sensitive files from tracking"
+git push
