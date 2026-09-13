@@ -1,0 +1,14 @@
+# API secret / environment
+.env
+*.env
+
+# python cache
+__pycache__/
+*.pyc
+
+# local output csv
+output_*.csv
+
+# real literature data (never push real data)
+*.bib
+real_dataset*.csv
