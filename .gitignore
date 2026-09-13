@@ -1,4 +1,27 @@
-git rm -r --cached .
-git add .
-git commit -m "chore: enforce data desensitization and remove sensitive files from tracking"
-git push
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Output files
+output/
+screening_results.xlsx
+screening_results.csv
+
+# Large or private data
+data/
+*.xlsx
+*.csv
+
+# IDE settings
+.vscode/
+.idea/
